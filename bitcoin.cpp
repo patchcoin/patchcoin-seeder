@@ -23,6 +23,9 @@ class CNode {
   int ban;
   int64 doneAfter;
   CAddress you;
+  bool fGotVerack;
+  bool fGotScack;
+  int64 scackTimeout;
 
   int GetTimeout() {
       if (you.IsTor())
@@ -38,14 +41,14 @@ class CNode {
     nMessageStart = vSend.size();
 //    printf("%s: SEND %s\n", ToString(you).c_str(), pszCommand); 
   }
-  
+
   void AbortMessage() {
     if (nHeaderStart == -1) return;
     vSend.resize(nHeaderStart);
     nHeaderStart = -1;
     nMessageStart = -1;
   }
-  
+
   void EndMessage() {
     if (nHeaderStart == -1) return;
     unsigned int nSize = vSend.size() - nMessageStart;
@@ -58,7 +61,7 @@ class CNode {
     nHeaderStart = -1;
     nMessageStart = -1;
   }
-  
+
   void Send() {
     if (sock == INVALID_SOCKET) return;
     if (vSend.empty()) return;
@@ -70,7 +73,7 @@ class CNode {
       sock = INVALID_SOCKET;
     }
   }
- 
+
   void PushVersion() {
     int64 nTime = time(NULL);
     uint64 nLocalNonce = BITCOIN_SEED_NONCE;
@@ -82,7 +85,7 @@ class CNode {
     vSend << cfg_protocol_version << nLocalServices << nTime << you << me << nLocalNonce << ver << nCurrentBlock << fRelayTxs;
     EndMessage();
   }
- 
+
   void GotVersion() {
     // printf("\n%s: version %i\n", ToString(you).c_str(), nVersion);
     if (vAddr) {
@@ -114,13 +117,21 @@ class CNode {
       vSend.SetVersion(min(nVersion, cfg_protocol_version));
       return false;
     }
-    
+
     if (strCommand == "verack") {
       this->vRecv.SetVersion(min(nVersion, cfg_protocol_version));
+      fGotVerack = true;
+      scackTimeout = time(NULL) + 10;
       GotVersion();
       return false;
     }
-    
+
+    if (strCommand == "scack") {
+      fGotScack = true;
+      // printf("%s: received scack\n", ToString(you).c_str());
+      return false;
+    }
+
     if (strCommand == "addr" && vAddr) {
       vector<CAddress> vAddrNew;
       vRecv >> vAddrNew;
@@ -143,10 +154,10 @@ class CNode {
       }
       return false;
     }
-    
+
     return false;
   }
-  
+
   bool ProcessMessages() {
     if (vRecv.empty()) return false;
     do {
@@ -162,16 +173,16 @@ class CNode {
       vector<char> vHeaderSave(vRecv.begin(), vRecv.begin() + nHeaderSize);
       CMessageHeader hdr;
       vRecv >> hdr;
-      if (!hdr.IsValid()) { 
+      if (!hdr.IsValid()) {
         // printf("%s: BAD (invalid header)\n", ToString(you).c_str());
         ban = 100000; return true;
       }
       string strCommand = hdr.GetCommand();
       unsigned int nMessageSize = hdr.nMessageSize;
-      if (nMessageSize > MAX_SIZE) { 
+      if (nMessageSize > MAX_SIZE) {
         // printf("%s: BAD (message too large)\n", ToString(you).c_str());
         ban = 100000;
-        return true; 
+        return true;
       }
       if (nMessageSize > vRecv.size()) {
         vRecv.insert(vRecv.begin(), vHeaderSave.begin(), vHeaderSave.end());
@@ -191,14 +202,17 @@ class CNode {
     } while(1);
     return false;
   }
-  
+
 public:
-  CNode(const CService& ip, vector<CAddress>* vAddrIn) : you(ip), nHeaderStart(-1), nMessageStart(-1), vAddr(vAddrIn), ban(0), doneAfter(0), nVersion(0) {
+  CNode(const CService& ip, vector<CAddress>* vAddrIn)
+    : you(ip), nHeaderStart(-1), nMessageStart(-1), vAddr(vAddrIn), ban(0),
+      doneAfter(0), nVersion(0), fGotVerack(false), fGotScack(false), scackTimeout(0) {
     vSend.SetType(SER_NETWORK);
     vSend.SetVersion(cfg_init_proto_version);
     vRecv.SetType(SER_NETWORK);
     vRecv.SetVersion(cfg_init_proto_version);
   }
+
   bool Run() {
     bool res = true;
     if (!ConnectSocket(you, sock)) return false;
@@ -206,6 +220,12 @@ public:
     Send();
     int64 now;
     while (now = time(NULL), ban == 0 && (doneAfter == 0 || doneAfter > now) && sock != INVALID_SOCKET) {
+      if (fGotVerack && !fGotScack && scackTimeout > 0 && now > scackTimeout) {
+        // printf("%s: BAD (no scack received after verack)\n", ToString(you).c_str());
+        ban = 10000;
+        break;
+      }
+
       char pchBuf[0x10000];
       fd_set read_set, except_set;
       FD_ZERO(&read_set);
@@ -245,21 +265,28 @@ public:
     if (sock == INVALID_SOCKET) res = false;
     close(sock);
     sock = INVALID_SOCKET;
+
+    if (fGotVerack && !fGotScack && ban == 0) {
+      // printf("%s: BAD (no scack received)\n", ToString(you).c_str());
+      ban = 10000;
+      res = false;
+    }
+
     return (ban == 0) && res;
   }
-  
+
   int GetBan() {
     return ban;
   }
-  
+
   int GetClientVersion() {
     return nVersion;
   }
-  
+
   std::string GetClientSubVersion() {
     return strSubVer;
   }
-  
+
   int GetStartingHeight() {
     return nStartingHeight;
   }
@@ -274,9 +301,9 @@ bool TestNode(const CService &cip, int &ban, int &clientV, std::string &clientSV
     CNode node(cip, vAddr);
     bool ret = node.Run();
     if (!ret)
-		ban = node.GetBan();
-	else
-		ban = 0;
+      ban = node.GetBan();
+    else
+      ban = 0;
     clientV = node.GetClientVersion();
     clientSV = node.GetClientSubVersion();
     blocks = node.GetStartingHeight();
